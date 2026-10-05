@@ -1,0 +1,74 @@
+// Public, client-facing API. Served by the gateway (gateway/).
+//
+// One RPC = one image. Batching is an internal optimization and is invisible to
+// clients, except for the optional ServerTiming diagnostics in the response.
+//
+// FROZEN CONTRACT: do not edit from a component worktree. See CLAUDE.md.
+
+syntax = "proto3";
+
+package batchserve.v1;
+
+option go_package = "batchserve/gen/go/batchservev1;batchservev1";
+
+service Detector {
+  // Detect runs object detection on a single image.
+  //
+  // Deadlines: set a gRPC deadline on the call (e.g. context.WithTimeout in Go).
+  // There is deliberately no deadline field in the message. gRPC already
+  // propagates the deadline in a header, and the gateway reads it from ctx.
+  //
+  // Status codes:
+  //   OK                  Success. `detections` may be empty.
+  //   INVALID_ARGUMENT    Image empty, larger than the gateway limit, or the
+  //                       worker could not decode it.
+  //   RESOURCE_EXHAUSTED  Queue full. The request was NOT queued. Back off and retry.
+  //   DEADLINE_EXCEEDED   The deadline expired before a result was ready.
+  //   CANCELLED           The client cancelled the call.
+  //   UNAVAILABLE         The worker failed or timed out, or the gateway is shutting down.
+  //   INTERNAL            Bug: e.g. the worker returned a malformed batch response.
+  rpc Detect(DetectRequest) returns (DetectResponse);
+}
+
+message DetectRequest {
+  // Encoded image file bytes: JPEG or PNG. NOT raw pixels.
+  // The worker decodes and resizes; the gateway never looks inside.
+  bytes image = 1;
+}
+
+message DetectResponse {
+  repeated Detection detections = 1;
+
+  // How this request was served. Used by the load generator to plot batch-size
+  // distributions and queue wait without scraping Prometheus.
+  ServerTiming timing = 2;
+}
+
+message Detection {
+  BoundingBox box = 1;
+  int32 class_id = 2;     // COCO class index, 0..79.
+  string class_name = 3;  // e.g. "person". Filled by the worker.
+  float score = 4;        // Confidence in [0, 1].
+}
+
+// Axis-aligned box in ORIGINAL image pixel coordinates (not the 640x640 model
+// input space). Origin is the top-left corner. Clamped to the image bounds.
+message BoundingBox {
+  float x_min = 1;
+  float y_min = 2;
+  float x_max = 3;
+  float y_max = 4;
+}
+
+message ServerTiming {
+  uint32 batch_size = 1;              // Number of images in the batch this request ran in.
+  int64 queue_wait_us = 2;            // Admission -> batch dispatched to worker.
+  int64 batch_latency_us = 3;         // InferBatch RPC round trip for that batch.
+  DispatchReason dispatch_reason = 4; // Why the batch was sent.
+}
+
+enum DispatchReason {
+  DISPATCH_REASON_UNSPECIFIED = 0;
+  DISPATCH_REASON_FULL = 1;     // Reached max_batch_size.
+  DISPATCH_REASON_TIMEOUT = 2;  // Oldest request reached max_wait.
+}

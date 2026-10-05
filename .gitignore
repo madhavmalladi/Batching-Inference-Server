@@ -1,0 +1,7 @@
+# Root ignores only. Components add their own .gitignore inside their directory.
+/bin/
+.DS_Store
+*.onnx
+*.pt
+.venv/
+__pycache__/

@@ -1,0 +1,61 @@
+// Internal API: gateway -> inference worker. Implemented by worker/ (real model)
+// and gateway/cmd/fakeworker (fake for tests).
+//
+// FROZEN CONTRACT: do not edit from a component worktree. See CLAUDE.md.
+
+syntax = "proto3";
+
+package batchserve.v1;
+
+import "batchserve/v1/detector.proto";
+
+option go_package = "batchserve/gen/go/batchservev1;batchservev1";
+
+service InferenceWorker {
+  // InferBatch runs the model once over every image in the batch.
+  //
+  // Contract:
+  //   * response.results has exactly len(request.images) entries, in the SAME
+  //     ORDER as the request. results[i].request_id == images[i].request_id.
+  //   * A bad image (e.g. undecodable) does NOT fail the batch: set
+  //     results[i].error and leave its detections empty. The other images
+  //     still return results.
+  //   * A non-OK gRPC status means the whole batch failed (e.g. the ONNX
+  //     Runtime Run() call threw). The gateway then fails every request in the batch.
+  //   * An empty batch returns OK with zero results.
+  //
+  // The worker also serves the standard gRPC health service (grpc.health.v1)
+  // and reports SERVING only after the model has loaded.
+  rpc InferBatch(InferBatchRequest) returns (InferBatchResponse);
+}
+
+message InferBatchRequest {
+  uint64 batch_id = 1;  // Gateway-assigned, monotonically increasing. For logs only.
+  repeated WorkerImage images = 2;
+}
+
+message WorkerImage {
+  // Gateway-assigned ID, unique per gateway process. The worker echoes it back
+  // unchanged and never interprets it.
+  uint64 request_id = 1;
+  bytes data = 2;  // Encoded JPEG/PNG, passed through from DetectRequest.image.
+}
+
+message InferBatchResponse {
+  uint64 batch_id = 1;
+  repeated ImageResult results = 2;  // Same length and order as request.images.
+  WorkerTiming timing = 3;
+}
+
+message ImageResult {
+  uint64 request_id = 1;
+  repeated Detection detections = 2;
+  string error = 3;  // Empty means success. Non-empty: this image failed, detections is empty.
+}
+
+// Time spent in each phase for the whole batch, measured inside the worker.
+message WorkerTiming {
+  int64 preprocess_us = 1;   // Decode + letterbox + pack into one tensor.
+  int64 inference_us = 2;    // Session::Run only.
+  int64 postprocess_us = 3;  // Decode output + NMS + un-letterbox.
+}
