@@ -68,6 +68,12 @@ target_include_directories(worker_core PUBLIC src)
 target_include_directories(worker_core SYSTEM PRIVATE third_party)
 worker_target_options(worker_core)
 
+# --- ONNX Runtime wrapper ----------------------------------------------------
+add_library(worker_detector STATIC src/detector.cpp)
+target_include_directories(worker_detector SYSTEM PRIVATE ${ORT_INCLUDE_DIR})
+target_link_libraries(worker_detector PUBLIC worker_core ${ORT_LIBRARY})
+worker_target_options(worker_detector)
+
 # --- Tests -------------------------------------------------------------------
 enable_testing()
 include(FetchContent)
@@ -81,8 +87,9 @@ add_executable(worker_tests
   tests/decode_test.cpp
   tests/letterbox_test.cpp
   tests/nms_test.cpp
-  tests/postprocess_test.cpp)
-target_link_libraries(worker_tests PRIVATE worker_core GTest::gtest_main)
+  tests/postprocess_test.cpp
+  tests/detector_test.cpp)
+target_link_libraries(worker_tests PRIVATE worker_detector GTest::gtest_main)
 # Tests locate models/ and testdata/ through this, so they work from any cwd.
 target_compile_definitions(worker_tests PRIVATE WORKER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 worker_target_options(worker_tests)
