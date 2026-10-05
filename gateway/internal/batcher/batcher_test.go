@@ -13,10 +13,10 @@ import (
 	"testing/synctest"
 	"time"
 
-	pb "batchserve/gen/go/batchservev1"
 	"batchserve/gateway/internal/batcher"
 	"batchserve/gateway/internal/fakeworker"
 	"batchserve/gateway/internal/testrig"
+	pb "batchserve/gen/go/batchservev1"
 )
 
 const ms = time.Millisecond
