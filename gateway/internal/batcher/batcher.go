@@ -99,7 +99,16 @@ type Batcher struct {
 	sem    chan struct{} // counting semaphore: a send acquires a slot, a receive releases it
 	nextID atomic.Uint64 // request IDs; atomic because every handler goroutine calls Submit
 	wg     sync.WaitGroup
+
+	// Shutdown signals. closing is set the moment Run sees ctx cancelled, so
+	// new requests fail fast. stopped is closed when Run has fully exited; it
+	// wakes any request that slipped into the queue after the final drain and
+	// would otherwise wait forever for a batcher that no longer exists.
+	closing atomic.Bool
+	stopped chan struct{}
 }
+
+var errShuttingDown = status.Error(codes.Unavailable, "gateway is shutting down")
 
 func New(cfg Config, inferer Inferer, m *metrics.Metrics) (*Batcher, error) {
 	if err := cfg.Validate(); err != nil {
@@ -111,6 +120,7 @@ func New(cfg Config, inferer Inferer, m *metrics.Metrics) (*Batcher, error) {
 		m:       m,
 		queue:   make(chan *pending, cfg.QueueSize),
 		sem:     make(chan struct{}, cfg.MaxInflight),
+		stopped: make(chan struct{}),
 	}
 	m.BindQueueDepth(func() float64 { return float64(len(b.queue)) })
 	return b, nil
@@ -125,6 +135,10 @@ func (b *Batcher) Submit(ctx context.Context, image []byte) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		b.m.Expired.WithLabelValues(metrics.StageAdmission).Inc()
 		return Result{}, status.FromContextError(err).Err()
+	}
+
+	if b.closing.Load() {
+		return Result{}, errShuttingDown
 	}
 
 	p := &pending{
@@ -156,6 +170,15 @@ func (b *Batcher) Submit(ctx context.Context, image []byte) (Result, error) {
 		return o.Result, o.Err
 	case <-ctx.Done():
 		return Result{}, status.FromContextError(ctx.Err()).Err()
+	case <-b.stopped:
+		// Prefer a result that is already there: select picks randomly when
+		// several cases are ready, and a finished request shouldn't be failed.
+		select {
+		case o := <-p.result:
+			return o.Result, o.Err
+		default:
+			return Result{}, errShuttingDown
+		}
 	}
 }
 
@@ -174,7 +197,15 @@ func (b *Batcher) live(p *pending) bool {
 
 // Run is the single batcher goroutine. It returns when ctx is cancelled and
 // every in-flight batch has finished.
+//
+// Shutdown policy: batches already at the worker run to completion (their
+// clients get real answers); anything not yet sent fails with UNAVAILABLE.
+// For a graceful stop, main first calls grpc's GracefulStop (which waits for
+// all handlers, so the queue drains normally) and only then cancels ctx.
 func (b *Batcher) Run(ctx context.Context) {
+	// Defers run last-in-first-out: first wait for in-flight batches, THEN
+	// close stopped, so stopped never wakes a request that is mid-flight.
+	defer close(b.stopped)
 	defer b.wg.Wait() // don't return while dispatch goroutines are still using the worker
 
 	var batchID uint64
@@ -186,18 +217,38 @@ func (b *Batcher) Run(ctx context.Context) {
 		select {
 		case b.sem <- struct{}{}:
 		case <-ctx.Done():
+			b.failUnsent(nil)
 			return
 		}
 
 		batch, reason, ok := b.formBatch(ctx)
 		if !ok { // shutting down
 			<-b.sem
+			b.failUnsent(batch)
 			return
 		}
 
 		batchID++
 		b.wg.Add(1)
 		go b.dispatch(batchID, batch, reason) // releases the slot when done
+	}
+}
+
+// failUnsent fails the batch that was being formed plus everything still in
+// the queue. Only Run calls it, after setting closing, so nothing else is
+// reading the queue. A request that enqueues after the drain is caught by stopped.
+func (b *Batcher) failUnsent(batch []*pending) {
+	b.closing.Store(true)
+	for _, p := range batch {
+		p.result <- outcome{Err: errShuttingDown} // capacity 1: never blocks
+	}
+	for {
+		select {
+		case p := <-b.queue:
+			p.result <- outcome{Err: errShuttingDown}
+		default:
+			return
+		}
 	}
 }
 

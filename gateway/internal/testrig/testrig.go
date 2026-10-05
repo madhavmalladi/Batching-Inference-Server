@@ -78,6 +78,10 @@ func New(opts Options) *Rig {
 	return r
 }
 
+// Stop asks the batcher to shut down without waiting for it (in-flight batches
+// keep running until they finish).
+func (r *Rig) Stop() { r.cancel() }
+
 // Close stops the batcher and waits for it, so no goroutine outlives the test.
 func (r *Rig) Close() {
 	r.cancel()
