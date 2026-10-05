@@ -163,9 +163,10 @@ TEST_F(DetectorTest, MixedSizesInOneBatch) {
     }
   }
 
-  // The bus spans nearly the full width of the portrait frame (reference box is about
-  // x 22..805, y 231..756 in bus-image pixels), so its box must be large in THIS
-  // image's pixels, not in 640x640 model pixels.
+  // The bus spans nearly the full width of the portrait frame (we measured about
+  // x 35..797, y 230..767 here; `yolo predict` gives slightly different numbers because
+  // it letterboxes to a rectangle, see WALKTHROUGH.md). Loose bounds on purpose: the point
+  // is that the box is large in THIS image's pixels, not in 640x640 model pixels.
   const Detection* bus = nullptr;
   for (const Detection& d : r.images[0].detections)
     if (d.class_id == kBus && (!bus || d.score > bus->score)) bus = &d;
