@@ -62,7 +62,7 @@ endfunction()
 
 # --- Pure code: no ONNX Runtime, no gRPC -------------------------------------
 # Decode, letterbox, NMS, postprocess. Kept separate so its tests build and run fast.
-add_library(worker_core STATIC src/image.cpp)
+add_library(worker_core STATIC src/image.cpp src/postprocess.cpp)
 target_include_directories(worker_core PUBLIC src)
 # SYSTEM: silences warnings that come from stb_image.h.
 target_include_directories(worker_core SYSTEM PRIVATE third_party)
@@ -79,7 +79,8 @@ include(GoogleTest)
 
 add_executable(worker_tests
   tests/decode_test.cpp
-  tests/letterbox_test.cpp)
+  tests/letterbox_test.cpp
+  tests/nms_test.cpp)
 target_link_libraries(worker_tests PRIVATE worker_core GTest::gtest_main)
 # Tests locate models/ and testdata/ through this, so they work from any cwd.
 target_compile_definitions(worker_tests PRIVATE WORKER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
