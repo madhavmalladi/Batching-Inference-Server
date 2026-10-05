@@ -37,4 +37,32 @@ float Iou(const Box& a, const Box& b);
 // has already cut n from 8400 down to a few dozen.
 std::vector<Detection> Nms(std::vector<Detection> detections, float iou_threshold);
 
+// YOLOv8 predicts 8400 candidate boxes per image. Each candidate is a column of
+// 84 numbers: 4 box values then 80 class scores. (v8 has no separate "objectness"
+// score, unlike v5: the class score alone is the confidence.)
+constexpr int kNumClasses = 80;
+constexpr int kNumChannels = 4 + kNumClasses;  // 84
+
+struct PostprocessParams {
+  float conf_threshold = 0.25f;  // drop candidates scoring at or below this
+  float iou_threshold = 0.45f;   // NMS overlap limit
+  int max_detections = 100;      // keep at most this many per image
+};
+
+// Converts ONE image's raw model output into final detections.
+//
+//   output          [84, num_candidates]  row-major, i.e. output[c * num_candidates + j]
+//                   is channel c of candidate j. Channels 0..3 are the box
+//                   (center x, center y, width, height) in 640x640 model pixels;
+//                   channels 4..83 are the 80 class scores. This is a slice of the
+//                   batch output [N, 84, 8400]: image i starts at i * 84 * 8400.
+//   letterbox       how the image was resized/padded, so boxes can be mapped back.
+//
+// Steps: best class per candidate -> drop low scores -> cx,cy,w,h to corners ->
+// NMS -> keep top max_detections -> undo letterbox -> clamp to the image.
+// Boxes come back in ORIGINAL image pixels, sorted by score (highest first).
+std::vector<Detection> Postprocess(const float* output, int num_candidates,
+                                   const LetterboxInfo& letterbox,
+                                   const PostprocessParams& params);
+
 }  // namespace worker

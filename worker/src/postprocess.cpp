@@ -1,6 +1,7 @@
 #include "postprocess.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace worker {
 
@@ -41,6 +42,65 @@ std::vector<Detection> Nms(std::vector<Detection> detections, float iou_threshol
       }
     }
     if (!suppressed) kept.push_back(candidate);
+  }
+  return kept;
+}
+
+std::vector<Detection> Postprocess(const float* output, int num_candidates,
+                                   const LetterboxInfo& letterbox,
+                                   const PostprocessParams& params) {
+  const size_t n = static_cast<size_t>(num_candidates);
+
+  // 1. Best class per candidate. We loop class-by-class (outer) and candidate
+  //    (inner) because the data is laid out [channel][candidate]: this way we read
+  //    memory front to back instead of jumping 8400 floats at every step.
+  std::vector<float> best_score(n, -std::numeric_limits<float>::infinity());
+  std::vector<int> best_class(n, 0);
+  for (int c = 0; c < kNumClasses; ++c) {
+    const float* scores = output + static_cast<size_t>(4 + c) * n;  // [num_candidates]
+    for (size_t j = 0; j < n; ++j) {
+      if (scores[j] > best_score[j]) {
+        best_score[j] = scores[j];
+        best_class[j] = c;
+      }
+    }
+  }
+
+  // 2 + 3. Keep confident candidates and convert (cx, cy, w, h) to corners.
+  //        Still in 640x640 model space here.
+  std::vector<Detection> candidates;
+  for (size_t j = 0; j < n; ++j) {
+    // Written as !(a > b) rather than (a <= b) so a NaN score is dropped too.
+    if (!(best_score[j] > params.conf_threshold)) continue;
+    const float cx = output[0 * n + j];
+    const float cy = output[1 * n + j];
+    const float w = output[2 * n + j];
+    const float h = output[3 * n + j];
+    Detection d;
+    d.box = Box{cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2};
+    d.class_id = best_class[j];
+    d.score = best_score[j];
+    candidates.push_back(d);
+  }
+
+  // 4 + 5. NMS (returns best-first), then cap. Capping AFTER NMS keeps the best
+  //        distinct objects; capping before would let duplicates use up the slots.
+  std::vector<Detection> kept = Nms(std::move(candidates), params.iou_threshold);
+  if (static_cast<int>(kept.size()) > params.max_detections) {
+    kept.resize(params.max_detections);
+  }
+
+  // 6. Undo the letterbox: subtract the padding, then divide by the scale. (IoU is
+  //    unchanged by a shift-and-scale, so NMS above gave the same result it would
+  //    have in original-image space.) Then clamp, because the model can predict
+  //    boxes that stick out past the image edge.
+  const float max_x = static_cast<float>(letterbox.orig_width);
+  const float max_y = static_cast<float>(letterbox.orig_height);
+  for (Detection& d : kept) {
+    d.box.x_min = std::clamp((d.box.x_min - letterbox.pad_x) / letterbox.scale, 0.0f, max_x);
+    d.box.x_max = std::clamp((d.box.x_max - letterbox.pad_x) / letterbox.scale, 0.0f, max_x);
+    d.box.y_min = std::clamp((d.box.y_min - letterbox.pad_y) / letterbox.scale, 0.0f, max_y);
+    d.box.y_max = std::clamp((d.box.y_max - letterbox.pad_y) / letterbox.scale, 0.0f, max_y);
   }
   return kept;
 }
