@@ -80,6 +80,7 @@ type outcome struct {
 type pending struct {
 	id         uint64
 	image      []byte
+	ctx        context.Context // the client's ctx: its deadline and cancellation
 	enqueuedAt time.Time
 
 	// result has capacity 1 so the dispatcher's send NEVER blocks, even if the
@@ -118,9 +119,18 @@ func New(cfg Config, inferer Inferer, m *metrics.Metrics) (*Batcher, error) {
 // Submit admits one request and waits for its result. It runs in the caller's
 // own goroutine (one per gRPC call), so blocking here is cheap and simple.
 func (b *Batcher) Submit(ctx context.Context, image []byte) (Result, error) {
+	// Deadline check 1 of 3 (docs/design.md §7): don't queue work that is
+	// already dead. grpc-go cancels ctx when the client disconnects, so this
+	// also covers a client that went away before we even started.
+	if err := ctx.Err(); err != nil {
+		b.m.Expired.WithLabelValues(metrics.StageAdmission).Inc()
+		return Result{}, status.FromContextError(err).Err()
+	}
+
 	p := &pending{
 		id:         b.nextID.Add(1),
 		image:      image,
+		ctx:        ctx,
 		enqueuedAt: time.Now(),
 		result:     make(chan outcome, 1),
 	}
@@ -136,8 +146,30 @@ func (b *Batcher) Submit(ctx context.Context, image []byte) (Result, error) {
 		return Result{}, status.Error(codes.ResourceExhausted, "queue full")
 	}
 
-	o := <-p.result
-	return o.Result, o.Err
+	// Deadline check 3 of 3: wait for the result OR the client's own deadline,
+	// whichever comes first. This is what makes a client with a 30 ms deadline
+	// get DEADLINE_EXCEEDED at 30 ms even though its batch runs for 100 ms. We
+	// do not cancel the batch: its other requests are still valid, and p.result
+	// (capacity 1) soaks up the late answer harmlessly.
+	select {
+	case o := <-p.result:
+		return o.Result, o.Err
+	case <-ctx.Done():
+		return Result{}, status.FromContextError(ctx.Err()).Err()
+	}
+}
+
+// live reports whether p's client is still waiting. If not, it counts p as
+// expired in the queue. This is the other half of LAZY DELETION: a channel
+// can't remove an item from its middle, so expired requests stay in the queue
+// and are skipped here when they reach the front. An expired request keeps its
+// queue slot until then; that is the price of using a plain channel.
+func (b *Batcher) live(p *pending) bool {
+	if p.ctx.Err() == nil {
+		return true
+	}
+	b.m.Expired.WithLabelValues(metrics.StageQueued).Inc()
+	return false
 }
 
 // Run is the single batcher goroutine. It returns when ctx is cancelled and
@@ -172,11 +204,20 @@ func (b *Batcher) Run(ctx context.Context) {
 // formBatch blocks for the first request, then fills the batch until it is
 // full or the oldest request's deadline arrives. This function is the policy.
 func (b *Batcher) formBatch(ctx context.Context) (batch []*pending, reason pb.DispatchReason, ok bool) {
+	// Deadline check 2 of 3: skip requests whose client has already left, so no
+	// inference is spent on an answer nobody will read. This is where most of
+	// the savings come from under overload. We keep waiting until a LIVE
+	// request arrives; the batch deadline is anchored on that one.
 	var first *pending
-	select {
-	case first = <-b.queue:
-	case <-ctx.Done():
-		return nil, 0, false
+	for first == nil {
+		select {
+		case p := <-b.queue:
+			if b.live(p) {
+				first = p
+			}
+		case <-ctx.Done():
+			return nil, 0, false
+		}
 	}
 	batch = append(make([]*pending, 0, b.cfg.MaxBatchSize), first)
 
@@ -193,7 +234,9 @@ drain:
 	for len(batch) < b.cfg.MaxBatchSize {
 		select {
 		case p := <-b.queue:
-			batch = append(batch, p)
+			if b.live(p) {
+				batch = append(batch, p)
+			}
 		default:
 			break drain
 		}
@@ -209,7 +252,9 @@ drain:
 	for len(batch) < b.cfg.MaxBatchSize {
 		select {
 		case p := <-b.queue:
-			batch = append(batch, p)
+			if b.live(p) {
+				batch = append(batch, p)
+			}
 		case <-timer.C:
 			return batch, pb.DispatchReason_DISPATCH_REASON_TIMEOUT, true
 		case <-ctx.Done():
@@ -226,6 +271,19 @@ func (b *Batcher) dispatch(id uint64, batch []*pending, reason pb.DispatchReason
 	// Deferred first = runs last: the slot is released only after every result
 	// has been written, so F really bounds the work at the worker.
 	defer func() { <-b.sem }()
+
+	// Requests can also expire while the batch sits in formBatch's wait phase.
+	// Re-check just before sending; if nobody is left, send nothing. The
+	// deferred release above still frees the slot.
+	live := batch[:0]
+	for _, p := range batch {
+		if b.live(p) {
+			live = append(live, p)
+		}
+	}
+	if batch = live; len(batch) == 0 {
+		return
+	}
 
 	sent := time.Now()
 	req := &pb.InferBatchRequest{BatchId: id, Images: make([]*pb.WorkerImage, len(batch))}
@@ -261,6 +319,12 @@ func (b *Batcher) dispatch(id uint64, batch []*pending, reason pb.DispatchReason
 			}
 		}
 		p.result <- outcomes[i] // never blocks: capacity 1, and this is the only send
+		if p.ctx.Err() != nil {
+			// The client left while its batch was at the worker: the answer
+			// we just wrote goes unread. Counted here, once, at a point
+			// where "was it in flight?" is certain.
+			b.m.Expired.WithLabelValues(metrics.StageInflight).Inc()
+		}
 	}
 }
 
