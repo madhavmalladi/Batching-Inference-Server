@@ -78,7 +78,8 @@ FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
 
 add_executable(worker_tests
-  tests/decode_test.cpp)
+  tests/decode_test.cpp
+  tests/letterbox_test.cpp)
 target_link_libraries(worker_tests PRIVATE worker_core GTest::gtest_main)
 # Tests locate models/ and testdata/ through this, so they work from any cwd.
 target_compile_definitions(worker_tests PRIVATE WORKER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
