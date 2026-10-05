@@ -41,6 +41,15 @@ int CountClass(const std::vector<Detection>& dets, int class_id, float min_score
   }));
 }
 
+// Put at the top of a test that needs the real model: skips it (rather than failing)
+// when the model or sample images haven't been fetched. A macro, because GTEST_SKIP()
+// must run inside the test body itself to end that test.
+#define REQUIRE_MODEL()                                                               \
+  if (!detector_) {                                                                   \
+    GTEST_SKIP() << "needs models/yolov8n.onnx and testdata/*.jpg: run "              \
+                    "worker/scripts/export_model.sh and worker/scripts/fetch_testdata.sh"; \
+  }
+
 class DetectorTest : public ::testing::Test {
  protected:
   // Loading the model takes a moment, so load it once for the whole suite.
@@ -54,13 +63,6 @@ class DetectorTest : public ::testing::Test {
   }
   static void TearDownTestSuite() { detector_.reset(); }
 
-  void SetUp() override {
-    if (!detector_) {
-      GTEST_SKIP() << "needs models/yolov8n.onnx and testdata/*.jpg: run "
-                      "worker/scripts/export_model.sh and worker/scripts/fetch_testdata.sh";
-    }
-  }
-
   static std::unique_ptr<Detector> detector_;
   static std::string bus_;     // 810x1080 (portrait)
   static std::string zidane_;  // 1280x720 (landscape)
@@ -73,7 +75,7 @@ std::string DetectorTest::zidane_;
 }  // namespace
 
 // Needs no real model: the fixture is a 147-byte ONNX file made for this test.
-TEST(DetectorStartupTest, RejectsFixedBatchModel) {
+TEST_F(DetectorTest, RejectsFixedBatchModel) {
   DetectorOptions options;
   options.model_path = kStaticModel;
   try {
@@ -86,13 +88,13 @@ TEST(DetectorStartupTest, RejectsFixedBatchModel) {
   }
 }
 
-TEST(DetectorStartupTest, MissingModelFileThrows) {
+TEST_F(DetectorTest, MissingModelFileThrows) {
   DetectorOptions options;
   options.model_path = kRoot + "/models/does_not_exist.onnx";
   EXPECT_ANY_THROW(worker::CreateOrtDetector(options));
 }
 
-TEST(DetectorStartupTest, UnknownProviderThrows) {
+TEST_F(DetectorTest, UnknownProviderThrows) {
   DetectorOptions options;
   options.model_path = kStaticModel;
   options.provider = "tpu";
@@ -100,6 +102,7 @@ TEST(DetectorStartupTest, UnknownProviderThrows) {
 }
 
 TEST_F(DetectorTest, BusImageFindsPersonAndBus) {
+  REQUIRE_MODEL();
   BatchResult r = detector_->DetectBatch({bus_});
   ASSERT_EQ(r.images.size(), 1u);
   ASSERT_TRUE(r.images[0].error.empty()) << r.images[0].error;
@@ -114,6 +117,7 @@ TEST_F(DetectorTest, BusImageFindsPersonAndBus) {
 // THE key batching test: a batch must give the same answers as running each image
 // alone. If padding, indexing, or output slicing were wrong, this is where it shows.
 TEST_F(DetectorTest, BatchMatchesSingleRuns) {
+  REQUIRE_MODEL();
   // Alternating two different images catches both "batch mixes up images" and
   // "batch order is wrong" bugs.
   const std::vector<std::string_view> images = {bus_, zidane_, zidane_, bus_};
@@ -137,6 +141,7 @@ TEST_F(DetectorTest, BatchMatchesSingleRuns) {
 }
 
 TEST_F(DetectorTest, MixedSizesInOneBatch) {
+  REQUIRE_MODEL();
   // Three very different shapes in one tensor: 810x1080 portrait, 1280x720
   // landscape, and a 16x8 sliver that gets enlarged 40x.
   const std::string tiny(reinterpret_cast<const char*>(testimg::kJpeg16x8Red),
@@ -177,6 +182,7 @@ TEST_F(DetectorTest, MixedSizesInOneBatch) {
 }
 
 TEST_F(DetectorTest, BadImageDoesNotFailBatchOrShiftNeighbours) {
+  REQUIRE_MODEL();
   // The bad image sits in the MIDDLE: if results were assigned by tensor slot
   // instead of request position, zidane would receive bus's neighbour's results.
   BatchResult r = detector_->DetectBatch({bus_, "not an image", zidane_});
@@ -191,6 +197,7 @@ TEST_F(DetectorTest, BadImageDoesNotFailBatchOrShiftNeighbours) {
 }
 
 TEST_F(DetectorTest, AllImagesBadSkipsTheModel) {
+  REQUIRE_MODEL();
   BatchResult r = detector_->DetectBatch({"nope", ""});
   ASSERT_EQ(r.images.size(), 2u);
   EXPECT_FALSE(r.images[0].error.empty());
@@ -199,6 +206,7 @@ TEST_F(DetectorTest, AllImagesBadSkipsTheModel) {
 }
 
 TEST_F(DetectorTest, EmptyBatchReturnsNothing) {
+  REQUIRE_MODEL();
   BatchResult r = detector_->DetectBatch({});
   EXPECT_TRUE(r.images.empty());
 }
