@@ -4,3 +4,6 @@ testdata/
 # The repo-wide .gitignore excludes *.onnx (big exported models). This tiny
 # hand-made fixture is the one exception: tests need it to exist.
 !tests/fixtures/*.onnx
+
+# clangd index cache (editor-generated)
+.cache/
